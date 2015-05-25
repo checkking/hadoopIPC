@@ -16,19 +16,21 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.channels.CancelledKeyException;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Properties;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
-
-
 
 
 public abstract class Server {
@@ -41,6 +43,8 @@ public abstract class Server {
 	private int backlog;
 	private static ThreadLocal<Server> SERVER = new ThreadLocal<Server>();
 	private static ThreadLocal<Call> curCall = new ThreadLocal<Call>();
+	private static int INITIAL_RESP_BUF_SIZE = 10240;
+	private static int MAX_RESP_BUF_SIZE = 1024*1024;
 	private Class<? extends Serializable> paramClass;
 	private BlockingQueue<Call> callQueue; // queued calls
 	
@@ -48,13 +52,17 @@ public abstract class Server {
 			Collections.synchronizedList(new LinkedList<Connection>());
 	private int numConnections = 0;
 	
-	public Server(String addressString, int port,Class<? extends Serializable> paramClass, Properties conf){
+	private Responder responder;
+	
+	public Server(String addressString, int port,Class<? extends Serializable> paramClass, Properties conf) throws IOException{
 		this.addressString = addressString;
 		this.port = port;
 		this.conf = conf;
 		backlog = Integer.parseInt(conf.getProperty("server.listener.backlog","128"));
 		readThreadCnt = Integer.parseInt(conf.getProperty("server.listener.readTrheadCnt", "10"));
 		this.paramClass = paramClass;
+		
+		responder = new Responder();
 	}
 	
 	public static void bind(ServerSocket socket, InetSocketAddress address, int backlog) throws IOException{
@@ -95,7 +103,7 @@ public abstract class Server {
 		   Serializable param, long receiveTime)
    throws IOException;
 	
-	public void closeConnection(Connection c) {
+	public void closeConnection(Connection c) throws IOException {
 		synchronized (connectionList) {
 			if(connectionList.remove(c)) {
 				numConnections--;
@@ -175,25 +183,17 @@ public abstract class Server {
 		   rpcCount--;
 	   }
 	   
-	   private void close(){
+	   private void close() throws IOException{
 		   data = null;
 		   dataLengthBuffer = null;
 		   if(!channel.isOpen())
 			   return;
-		   try{
-			   socket.shutdownOutput();
-		   } catch(Exception e) {}
+
+			socket.shutdownOutput();
 		   if(channel.isOpen()){
-			   try {
 				channel.close();
-			} catch (IOException e) {
-			}
 		   }
-		   try {
 			socket.close();
-		} catch (IOException e) {
-		}
-		   
 	   }
 	   
 	   
@@ -312,7 +312,7 @@ public abstract class Server {
 			}
 		}
 		
-		public void doRead(SelectionKey key) throws InterruptedException {
+		public void doRead(SelectionKey key) throws InterruptedException, IOException {
 			int count = 0;
 			Connection c = (Connection) key.attachment();
 			if(c == null)
@@ -422,6 +422,8 @@ public abstract class Server {
 		@Override
 		public void run() {
 			SERVER.set(Server.this);
+			ByteArrayOutputStream buf = 
+					new ByteArrayOutputStream(INITIAL_RESP_BUF_SIZE);
 			while(running) {
 				try {
 					final Call call = callQueue.take();
@@ -436,12 +438,20 @@ public abstract class Server {
 					}
 					curCall.set(null);
 					synchronized (call.connection.responseQueue) {
-						 
+						 setupResponse(buf, call, error == null ? Status.SUCCESS : Status.ERROR, value, error);
+						 if(buf.size() > MAX_RESP_BUF_SIZE) {
+							 // print warning
+							 buf  = new ByteArrayOutputStream(INITIAL_RESP_BUF_SIZE);
+						 }
+						 responder.doResponse(call);
 					}
 					
 				} catch (InterruptedException e) {
 					// TODO Auto-generated catch block
 					
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
 				}
 				
 			}
@@ -449,4 +459,199 @@ public abstract class Server {
 		
 	}
 
+	private class Responder extends Thread{
+
+		private Selector writeSelector;
+		private int pending;
+		
+		final static int PURGE_INTERVAL = 900000; // 15mins
+		
+		Responder() throws IOException{
+			this.setName("IPC Server Responder");
+			this.setDaemon(true);
+			writeSelector = Selector.open();
+			pending = 0;
+		}
+		
+		public void incPending() {
+			pending++;
+		}
+		
+		public void decPending() {
+			pending--;
+			notify();
+		}
+		
+		public void waitPending() throws InterruptedException {
+			while ( pending > 0 ) {
+				wait();
+			}
+		}
+		
+		public void doResponse(Call call) throws IOException {
+			synchronized (call.connection.responseQueue) {
+				call.connection.responseQueue.addLast(call);
+				if(call.connection.responseQueue.size()==1) {
+					processResponse(call.connection.responseQueue, true);
+				}
+			}
+		}
+		
+		public void doAsyncWrite(SelectionKey key) throws IOException {
+			Call call = (Call) key.attachment();
+			if(call == null) {
+				return;
+			}
+	      if (key.channel() != call.connection.channel) {
+	          throw new IOException("doAsyncWrite: bad channel");
+	        }
+	      
+	      synchronized (call.connection.responseQueue) {
+			    if(processResponse(call.connection.responseQueue,false)) {
+			    	try{
+			    		key.interestOps(0);
+			    	}catch(CancelledKeyException e){
+			    		
+			    	}
+			    }
+		   }
+		}
+		
+		public void doPurge(Call call, long now) throws IOException {
+			LinkedList<Call> responseQueue = call.connection.responseQueue;
+			Call theCall = null;
+			synchronized (responseQueue) {
+				ListIterator<Call> iter = responseQueue.listIterator(0);
+				while(iter.hasNext()) {
+					theCall = iter.next();
+					if(theCall.timestamp + PURGE_INTERVAL > now) {
+						closeConnection(theCall.connection);
+						break;
+					}
+				}
+			}
+		}
+		
+		public boolean processResponse(LinkedList<Call> responseQueue, boolean inHandler) throws IOException{
+			boolean done = false;
+			boolean error = true;
+			int numElements = 0;
+			Call call = null;
+			try{
+				synchronized (responseQueue) {
+					numElements = responseQueue.size();
+					if(numElements == 0){
+						 error = false;
+						 return true;
+					}
+					
+					call = responseQueue.removeFirst();
+					SocketChannel channel = call.connection.channel;
+					int numBytes = channel.write(call.response);
+					if(numBytes < 0 )
+						return true;
+					
+					if(!call.response.hasRemaining()) {
+						call.connection.decRpcCount();
+						if(numElements == 1) {
+							done = true;
+						}
+						else {
+							done = false;
+						}
+					}
+					else {
+						call.connection.responseQueue.addFirst(call);
+						
+						if(inHandler) {
+							call.timestamp = System.currentTimeMillis();
+							incPending();
+							try {
+								writeSelector.wakeup();
+								channel.register(writeSelector, SelectionKey.OP_WRITE, call);
+							} catch (ClosedChannelException e) {
+								done = true;
+							} finally{
+								decPending();
+							}
+						}
+					}
+					
+					error = false;
+				}				
+			}finally{
+		        if (error && call != null) {
+		            done = true;               // error. no more data for this channel.
+		            closeConnection(call.connection);
+		          }
+			}
+			
+			return done;
+		}
+		
+		@Override
+		public void run() {
+			SERVER.set(Server.this);
+			long lastPurgeTime = 0;
+			
+			while(running){
+				try{
+					waitPending();
+					writeSelector.select(PURGE_INTERVAL);
+					Iterator<SelectionKey> iter =  writeSelector.selectedKeys().iterator();
+					SelectionKey key = null;
+					while(iter.hasNext()) {
+						key = iter.next();
+						iter.remove();
+						try{
+							if(key.isValid() && key.isWritable()) {
+								doAsyncWrite(key);
+							}
+						}catch(IOException e) {
+							
+						}
+						key = null;
+					}
+				
+				long now = System.currentTimeMillis();
+				if(now < lastPurgeTime + PURGE_INTERVAL) {
+					continue;
+				}
+				
+				lastPurgeTime = now;
+				ArrayList<Call> calls;
+				
+				synchronized (writeSelector.selectedKeys()) {
+					calls = new ArrayList<Call>(writeSelector.selectedKeys().size());
+					iter = writeSelector.selectedKeys().iterator();
+					while(iter.hasNext()) {
+						key = iter.next();
+						Call call = (Call) key.attachment();
+						if(call != null && call.connection.channel ==  key.channel()) {
+							calls.add(call);
+						}
+					}
+				}
+				
+				for(Call call : calls) {
+					try{
+						doPurge(call, now);
+					}catch(IOException ioe){
+						
+					}
+				}
+				
+				}catch(OutOfMemoryError ooe) {
+					try {
+						Thread.sleep(60000);
+					} catch (InterruptedException e) {
+					}
+				}
+				catch (Exception e){
+					
+				}
+			}
+		}
+		
+	}
 }
