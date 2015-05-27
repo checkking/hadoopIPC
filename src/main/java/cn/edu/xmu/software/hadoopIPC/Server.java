@@ -38,6 +38,7 @@ public abstract class Server {
 	private String addressString;
 	private int port;
 	private int readThreadCnt;
+	private int handlerCount;
 	private Properties conf;
 	volatile private boolean running = true;
 	private int backlog;
@@ -52,6 +53,8 @@ public abstract class Server {
 			Collections.synchronizedList(new LinkedList<Connection>());
 	private int numConnections = 0;
 	
+	private Listener listener;
+	private Handler[] handlers;
 	private Responder responder;
 	
 	public Server(String addressString, int port,Class<? extends Serializable> paramClass, Properties conf) throws IOException{
@@ -60,8 +63,11 @@ public abstract class Server {
 		this.conf = conf;
 		backlog = Integer.parseInt(conf.getProperty("server.listener.backlog","128"));
 		readThreadCnt = Integer.parseInt(conf.getProperty("server.listener.readTrheadCnt", "10"));
+		handlerCount = Integer.parseInt(conf.getProperty("server.handler.count", "10"));
 		this.paramClass = paramClass;
 		
+		listener = new Listener();
+		this.port = listener.getAddress().getPort();
 		responder = new Responder();
 	}
 	
@@ -109,6 +115,37 @@ public abstract class Server {
 				numConnections--;
 			}
 			c.close();
+		}
+	}
+	
+	public synchronized void start(){
+		this.listener.start();
+		this.responder.start();
+		handlers = new Handler[handlerCount];
+		for(int i = 0; i < handlerCount; i++) {
+			handlers[i] = new Handler(i);
+			handlers[i].start();
+		}
+	}
+	
+	public synchronized void stop() {
+		running = false;
+		if(handlers != null) {
+			for(int i = 0; i < handlerCount; i++) {
+				if(handlers[i] != null)
+					handlers[i].interrupt();
+			}
+		}
+		listener.interrupt();
+		listener.doStop();
+		responder.interrupt();
+		notifyAll();
+	}
+	
+	public synchronized void join() throws InterruptedException {
+		while(running)
+		{
+			wait();
 		}
 	}
 	
@@ -285,6 +322,10 @@ public abstract class Server {
 			this.setName("IPC Server listening on port "+port);
 			this.setDaemon(true);
 		}
+		
+		public InetSocketAddress getAddress(){
+			return address;
+		}
 
 		public Reader getReader() {
 			currentReader = (currentReader+1)%readers.length;
@@ -332,6 +373,23 @@ public abstract class Server {
 			else {
 				c.setLastContact(System.currentTimeMillis());
 			}
+		}
+		
+		public synchronized void doStop(){
+			if(selector != null) {
+				selector.wakeup();
+				Thread.yield();
+			}
+			
+			if(acceptChannel != null) {
+				try {
+					acceptChannel.socket().close();
+				} catch (IOException e) {
+					
+				}
+			}
+			
+			readPool.shutdown();
 		}
 		
 		@Override
